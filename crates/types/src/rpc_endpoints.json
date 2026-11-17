@@ -673,7 +673,7 @@
         },
         {
           "method": "surfnet_setTokenAccount",
-          "description": "A 'cheat code' method for developers to set or update a token account in Surfpool. It allows for updating properties like amount, delegate, state, delegated amount, and close authority. It can also configure (and optionally fund) a Token-2022 confidential-transfer account via the `update.confidential` field, letting tests skip the real multi-transaction Configure/Deposit/ApplyPendingBalance flow. This is designed to help developers quickly modify token account properties.",
+          "description": "A 'cheat code' method for developers to set or update a token account in Surfpool. It allows for updating properties like amount, delegate, state, delegated amount, and close authority. It can also configure (and optionally fund) a Token-2022 confidential-transfer account via the `update.confidential` field, letting tests skip the real multi-transaction Configure/Deposit/ApplyPendingBalance flow. The mint must already exist locally or be available from the configured upstream. In offline mode, create it first with surfnet_setAccount. If the mint is absent, both creation and updates fail with -32602 before the target token account is changed.",
           "params": [
             {
               "name": "owner",

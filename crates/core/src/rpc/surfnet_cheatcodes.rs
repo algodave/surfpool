@@ -290,6 +290,10 @@ pub trait SurfnetCheatcodes {
     ///
     /// This method allows developers to set or update various properties of a token account,
     /// including the token amount, delegate, state, delegated amount, and close authority.
+    /// The mint must exist locally or be fetched from the configured upstream. If it is
+    /// missing, the call returns an invalid-params error without changing the token account.
+    /// Create offline mint fixtures first with `surfnet_setAccount`, including when updating
+    /// an existing token account whose mint is absent.
     ///
     /// ## Parameters
     /// - `owner`: The base-58 encoded public key of the token account's owner.
@@ -1811,11 +1815,15 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                 .get_account(&remote_ctx, &mint, None)
                 .await?
                 .inner;
+            if get_mint_result.is_none() {
+                return Err(Error::invalid_params(format!(
+                    "Mint account {mint} not found; create it with surfnet_setAccount or make it available upstream"
+                )));
+            }
             // Mirror the real `ConfigureAccount`: when the mint charges a
             // transfer fee, a confidential account also needs the companion
             // confidential-transfer fee-amount extension.
             let mint_has_transfer_fee = confidential.is_some()
-                && !get_mint_result.is_none()
                 && mint_has_transfer_fee_config(get_mint_result.expected_data());
             let SvmAccessContext {
                 slot,
@@ -1827,8 +1835,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
 
             if token_account.is_none() {
                 let mut default = TokenAccount::new(&token_program_id, owner, mint, None);
-                let mint_data = (!get_mint_result.is_none())
-                    .then(|| get_mint_result.expected_data().as_slice());
+                let mint_data = Some(get_mint_result.expected_data().as_slice());
                 let mut data = default.pack_associated_account(mint_data).map_err(|e| {
                     Error::invalid_params(format!("Failed to initialize token account: {e}"))
                 })?;
@@ -3489,6 +3496,23 @@ mod tests {
             .svm_locker
             .with_svm_writer(|svm| svm.inner.set_account(*pubkey, account.clone()))
             .expect("Failed to set account");
+    }
+
+    fn token_mint_account(token_program: Pubkey) -> Account {
+        let mut data = vec![0; Mint::LEN];
+        Mint {
+            decimals: 6,
+            is_initialized: true,
+            ..Default::default()
+        }
+        .pack_into_slice(&mut data);
+        Account {
+            lamports: 1_000_000_000,
+            data,
+            owner: token_program,
+            executable: false,
+            rent_epoch: 0,
+        }
     }
 
     fn verify_snapshot_account(
@@ -5298,6 +5322,707 @@ mod tests {
         );
     }
 
+    mod token_accounts {
+        use std::sync::Mutex;
+
+        use async_trait::async_trait;
+        use base64::Engine as _;
+        use solana_client::{
+            nonblocking::rpc_client::RpcClient,
+            rpc_client::RpcClientConfig,
+            rpc_config::{RpcAccountInfoConfig, RpcTokenAccountsFilter},
+            rpc_request::RpcRequest,
+            rpc_response::RpcKeyedAccount,
+        };
+        use solana_rpc_client::rpc_sender::{RpcSender, RpcTransportStats};
+        use solana_rpc_client_api::client_error::{
+            ErrorKind as ClientErrorKind, Result as ClientResult,
+        };
+
+        use super::*;
+        use crate::{
+            rpc::accounts_scan::{AccountsScan, SurfpoolAccountsScanRpc},
+            surfnet::remote::SurfnetRemoteClient,
+        };
+
+        // Use the RPC update path so parsed queries see the mint metadata and account indexes.
+        async fn set_token_fixture(
+            client: &TestSetup<SurfnetCheatcodesRpc>,
+            pubkey: Pubkey,
+            account: Account,
+        ) {
+            client
+                .rpc
+                .set_account(
+                    Some(client.context.clone()),
+                    pubkey.to_string(),
+                    AccountUpdate {
+                        lamports: Some(account.lamports),
+                        data: Some(hex::encode(&account.data).into_bytes()),
+                        owner: Some(account.owner.to_string()),
+                        executable: Some(account.executable),
+                        rent_epoch: Some(account.rent_epoch),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        async fn local_token_accounts_by_owner(
+            client: &TestSetup<SurfnetCheatcodesRpc>,
+            owner: Pubkey,
+            token_program: Pubkey,
+        ) -> Vec<RpcKeyedAccount> {
+            let mut context = client.context.clone();
+            context.remote_rpc_client = None;
+            SurfpoolAccountsScanRpc
+                .get_token_accounts_by_owner(
+                    Some(context),
+                    owner.to_string(),
+                    RpcTokenAccountsFilter::ProgramId(token_program.to_string()),
+                    Some(RpcAccountInfoConfig {
+                        encoding: Some(UiAccountEncoding::JsonParsed),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap()
+                .value
+        }
+
+        #[test_case::test_case(spl_token_interface::id(); "classic")]
+        #[test_case::test_case(spl_token_2022_interface::id(); "token_2022")]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn test_set_token_account_missing_mint(token_program: Pubkey) {
+            let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+            let owner = Pubkey::new_unique();
+            let mint = Pubkey::new_unique();
+            let target =
+                get_associated_token_address_with_program_id(&owner, &mint, &token_program);
+
+            let result = client
+                .rpc
+                .set_token_account(
+                    Some(client.context.clone()),
+                    owner.to_string(),
+                    mint.to_string(),
+                    TokenAccountUpdate {
+                        amount: Some(42),
+                        ..Default::default()
+                    },
+                    Some(token_program.to_string()),
+                )
+                .await;
+            let persisted = client.context.svm_locker.get_account_local(&target).inner;
+            assert!(
+                result.is_err(),
+                "missing mint call returned {result:?}; target persisted: {}",
+                !persisted.is_none()
+            );
+            let error = result.unwrap_err();
+            assert_eq!(error.code, jsonrpc_core::ErrorCode::InvalidParams);
+            assert_eq!(
+                error.message,
+                format!(
+                    "Mint account {mint} not found; create it with surfnet_setAccount or make it available upstream"
+                )
+            );
+            assert!(persisted.is_none());
+            client.context.svm_locker.with_svm_reader(|svm| {
+                assert!(
+                    svm.token_accounts
+                        .get(&target.to_string())
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    svm.token_accounts_by_owner
+                        .get(&owner.to_string())
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    svm.token_accounts_by_mint
+                        .get(&mint.to_string())
+                        .unwrap()
+                        .is_none()
+                );
+            });
+            assert!(
+                local_token_accounts_by_owner(&client, owner, token_program)
+                    .await
+                    .is_empty()
+            );
+        }
+
+        #[test_case::test_case(spl_token_interface::id(); "classic")]
+        #[test_case::test_case(spl_token_2022_interface::id(); "token_2022")]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn test_set_token_account_local_mint_is_parsed(token_program: Pubkey) {
+            let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+            let owner = Pubkey::new_unique();
+            let mint = Pubkey::new_unique();
+            let target =
+                get_associated_token_address_with_program_id(&owner, &mint, &token_program);
+            set_token_fixture(&client, mint, token_mint_account(token_program)).await;
+
+            for amount in [42, 84] {
+                client
+                    .rpc
+                    .set_token_account(
+                        Some(client.context.clone()),
+                        owner.to_string(),
+                        mint.to_string(),
+                        TokenAccountUpdate {
+                            amount: Some(amount),
+                            ..Default::default()
+                        },
+                        Some(token_program.to_string()),
+                    )
+                    .await
+                    .unwrap();
+                let accounts = local_token_accounts_by_owner(&client, owner, token_program).await;
+                assert_eq!(accounts.len(), 1);
+                assert_eq!(accounts[0].pubkey, target.to_string());
+                let UiAccountData::Json(parsed) = &accounts[0].account.data else {
+                    panic!(
+                        "expected parsed token account, got {:?}",
+                        accounts[0].account.data
+                    );
+                };
+                assert_eq!(parsed.parsed["type"], "account");
+                let info = &parsed.parsed["info"];
+                assert_eq!(info["mint"], mint.to_string());
+                assert_eq!(info["owner"], owner.to_string());
+                assert_eq!(info["tokenAmount"]["amount"], amount.to_string());
+                assert_eq!(info["tokenAmount"]["decimals"], 6);
+            }
+        }
+
+        #[test_case::test_case(spl_token_interface::id(); "classic")]
+        #[test_case::test_case(spl_token_2022_interface::id(); "token_2022")]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn test_set_token_account_missing_mint_leaves_existing_target_unchanged(
+            token_program: Pubkey,
+        ) {
+            let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+            let owner = Pubkey::new_unique();
+            let mint = Pubkey::new_unique();
+            let target =
+                get_associated_token_address_with_program_id(&owner, &mint, &token_program);
+            // Seed a dangling account directly, as can exist in an older snapshot.
+            let original = Account {
+                lamports: 9_000_000,
+                data: TokenAccount::new(&token_program, owner, mint, None)
+                    .pack_associated_account(None)
+                    .unwrap(),
+                owner: token_program,
+                executable: false,
+                rent_epoch: 7,
+            };
+            let delegate = Pubkey::new_unique();
+            set_token_fixture(&client, target, original.clone()).await;
+            let before = local_token_accounts_by_owner(&client, owner, token_program).await;
+            assert_eq!(before.len(), 1);
+            let indexes = || {
+                client.context.svm_locker.with_svm_reader(|svm| {
+                    (
+                        svm.token_accounts.get(&target.to_string()).unwrap(),
+                        svm.token_accounts_by_owner.get(&owner.to_string()).unwrap(),
+                        svm.token_accounts_by_mint.get(&mint.to_string()).unwrap(),
+                        svm.token_accounts_by_delegate
+                            .get(&delegate.to_string())
+                            .unwrap(),
+                        svm.accounts_by_owner
+                            .get(&token_program.to_string())
+                            .unwrap(),
+                    )
+                })
+            };
+            let original_indexes = indexes();
+
+            let error = client
+                .rpc
+                .set_token_account(
+                    Some(client.context.clone()),
+                    owner.to_string(),
+                    mint.to_string(),
+                    TokenAccountUpdate {
+                        amount: Some(99),
+                        delegate: Some(SetSomeAccount::Account(delegate.to_string())),
+                        ..Default::default()
+                    },
+                    Some(token_program.to_string()),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, jsonrpc_core::ErrorCode::InvalidParams);
+            assert_eq!(
+                error.message,
+                format!(
+                    "Mint account {mint} not found; create it with surfnet_setAccount or make it available upstream"
+                )
+            );
+            assert_eq!(
+                client
+                    .context
+                    .svm_locker
+                    .get_account_local(&target)
+                    .inner
+                    .map_account()
+                    .unwrap(),
+                original
+            );
+            assert_eq!(indexes(), original_indexes);
+            assert_eq!(
+                serde_json::to_value(
+                    local_token_accounts_by_owner(&client, owner, token_program).await
+                )
+                .unwrap(),
+                serde_json::to_value(before).unwrap()
+            );
+        }
+
+        struct TokenMintSender {
+            mint: Pubkey,
+            account: Option<Account>,
+            fail: bool,
+            requests: Arc<Mutex<Vec<(RpcRequest, serde_json::Value)>>>,
+        }
+
+        #[async_trait]
+        impl RpcSender for TokenMintSender {
+            async fn send(
+                &self,
+                request: RpcRequest,
+                params: serde_json::Value,
+            ) -> ClientResult<serde_json::Value> {
+                self.requests
+                    .lock()
+                    .unwrap()
+                    .push((request, params.clone()));
+                if self.fail {
+                    return Err(ClientErrorKind::Custom("provider unavailable".to_string()).into());
+                }
+                let value = if params[0] == self.mint.to_string() {
+                    self.account.as_ref().map(|account| serde_json::json!({
+                        "lamports": account.lamports,
+                        "owner": account.owner.to_string(),
+                        "executable": account.executable,
+                        "rentEpoch": account.rent_epoch,
+                        "data": [base64::engine::general_purpose::STANDARD.encode(&account.data), "base64"],
+                    }))
+                } else {
+                    None
+                };
+                Ok(serde_json::json!({"context": {"slot": 123}, "value": value}))
+            }
+
+            fn get_transport_stats(&self) -> RpcTransportStats {
+                RpcTransportStats::default()
+            }
+
+            fn url(&self) -> String {
+                "http://token-mint.example".to_string()
+            }
+        }
+
+        #[test_case::test_case(spl_token_interface::id(); "classic")]
+        #[test_case::test_case(spl_token_2022_interface::id(); "token_2022")]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn test_set_token_account_local_accounts_do_not_contact_upstream(
+            token_program: Pubkey,
+        ) {
+            let mut client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+            let owner = Pubkey::new_unique();
+            let mint = Pubkey::new_unique();
+            set_token_fixture(&client, mint, token_mint_account(token_program)).await;
+            client
+                .rpc
+                .set_token_account(
+                    Some(client.context.clone()),
+                    owner.to_string(),
+                    mint.to_string(),
+                    TokenAccountUpdate {
+                        amount: Some(42),
+                        ..Default::default()
+                    },
+                    Some(token_program.to_string()),
+                )
+                .await
+                .unwrap();
+
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            client.context.remote_rpc_client = Some(SurfnetRemoteClient {
+                client: RpcClient::new_sender(
+                    TokenMintSender {
+                        mint,
+                        account: None,
+                        fail: true,
+                        requests: Arc::clone(&requests),
+                    },
+                    RpcClientConfig::default(),
+                )
+                .into(),
+            });
+            client
+                .rpc
+                .set_token_account(
+                    Some(client.context.clone()),
+                    owner.to_string(),
+                    mint.to_string(),
+                    TokenAccountUpdate {
+                        amount: Some(84),
+                        ..Default::default()
+                    },
+                    Some(token_program.to_string()),
+                )
+                .await
+                .unwrap();
+
+            let target =
+                get_associated_token_address_with_program_id(&owner, &mint, &token_program);
+            let account = client
+                .context
+                .svm_locker
+                .get_account_local(&target)
+                .inner
+                .map_account()
+                .unwrap();
+            assert_eq!(TokenAccount::unpack(&account.data).unwrap().amount(), 84);
+            assert!(requests.lock().unwrap().is_empty());
+        }
+
+        #[test_case::test_case(spl_token_interface::id(); "classic")]
+        #[test_case::test_case(spl_token_2022_interface::id(); "token_2022")]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn test_set_token_account_offline_marked_mint_is_not_fetched(token_program: Pubkey) {
+            let mut client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+            let owner = Pubkey::new_unique();
+            let mint = Pubkey::new_unique();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            client.context.remote_rpc_client = Some(SurfnetRemoteClient {
+                client: RpcClient::new_sender(
+                    TokenMintSender {
+                        mint,
+                        account: Some(token_mint_account(token_program)),
+                        fail: false,
+                        requests: Arc::clone(&requests),
+                    },
+                    RpcClientConfig::default(),
+                )
+                .into(),
+            });
+            client
+                .rpc
+                .offline_account(Some(client.context.clone()), mint.to_string(), None)
+                .await
+                .unwrap();
+
+            let error = client
+                .rpc
+                .set_token_account(
+                    Some(client.context.clone()),
+                    owner.to_string(),
+                    mint.to_string(),
+                    TokenAccountUpdate {
+                        amount: Some(42),
+                        ..Default::default()
+                    },
+                    Some(token_program.to_string()),
+                )
+                .await
+                .unwrap_err();
+
+            assert_eq!(error.code, jsonrpc_core::ErrorCode::InvalidParams);
+            assert_eq!(
+                error.message,
+                format!(
+                    "Mint account {mint} not found; create it with surfnet_setAccount or make it available upstream"
+                )
+            );
+            assert!(requests.lock().unwrap().is_empty());
+            let target =
+                get_associated_token_address_with_program_id(&owner, &mint, &token_program);
+            assert!(
+                client
+                    .context
+                    .svm_locker
+                    .get_account_local(&mint)
+                    .inner
+                    .is_none()
+            );
+            assert!(
+                client
+                    .context
+                    .svm_locker
+                    .get_account_local(&target)
+                    .inner
+                    .is_none()
+            );
+            assert!(
+                local_token_accounts_by_owner(&client, owner, token_program)
+                    .await
+                    .is_empty()
+            );
+        }
+
+        #[test_case::test_case(true, false; "fetched")]
+        #[test_case::test_case(false, false; "absent")]
+        #[test_case::test_case(false, true; "provider_failure")]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn test_set_token_account_remote_mint(found: bool, fail: bool) {
+            for token_program in [spl_token_interface::id(), spl_token_2022_interface::id()] {
+                let mut client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+                let owner = Pubkey::new_unique();
+                let mint = Pubkey::new_unique();
+                let target =
+                    get_associated_token_address_with_program_id(&owner, &mint, &token_program);
+                let requests = Arc::new(Mutex::new(Vec::new()));
+                let mint_account = token_mint_account(token_program);
+                client.context.remote_rpc_client = Some(SurfnetRemoteClient {
+                    client: RpcClient::new_sender(
+                        TokenMintSender {
+                            mint,
+                            account: found.then(|| mint_account.clone()),
+                            fail,
+                            requests: Arc::clone(&requests),
+                        },
+                        RpcClientConfig::default(),
+                    )
+                    .into(),
+                });
+
+                let result = client
+                    .rpc
+                    .set_token_account(
+                        Some(client.context.clone()),
+                        owner.to_string(),
+                        mint.to_string(),
+                        TokenAccountUpdate {
+                            amount: Some(42),
+                            ..Default::default()
+                        },
+                        Some(token_program.to_string()),
+                    )
+                    .await;
+                if found {
+                    result.unwrap();
+                    assert_eq!(
+                        client
+                            .context
+                            .svm_locker
+                            .get_account_local(&mint)
+                            .inner
+                            .map_account()
+                            .unwrap(),
+                        mint_account
+                    );
+                    let account = client
+                        .context
+                        .svm_locker
+                        .get_account_local(&target)
+                        .inner
+                        .map_account()
+                        .unwrap();
+                    let token = TokenAccount::unpack(&account.data).unwrap();
+                    assert_eq!(token.mint(), mint);
+                    assert_eq!(token.amount(), 42);
+                    let accounts =
+                        local_token_accounts_by_owner(&client, owner, token_program).await;
+                    assert_eq!(accounts.len(), 1);
+                    assert!(matches!(accounts[0].account.data, UiAccountData::Json(_)));
+                } else {
+                    let error = result.unwrap_err();
+                    if fail {
+                        assert_eq!(error.code, jsonrpc_core::ErrorCode::InternalError);
+                        assert_eq!(error.message, "Internal error");
+                        let data = error.data.unwrap().as_str().unwrap().to_string();
+                        assert!(
+                            data.contains(&format!("Failed to fetch account {mint} from remote:"))
+                        );
+                        assert!(data.contains("provider unavailable"), "{data}");
+                    } else {
+                        assert_eq!(error.code, jsonrpc_core::ErrorCode::InvalidParams);
+                        assert_eq!(
+                            error.message,
+                            format!(
+                                "Mint account {mint} not found; create it with surfnet_setAccount or make it available upstream"
+                            )
+                        );
+                    }
+                    assert!(
+                        client
+                            .context
+                            .svm_locker
+                            .get_account_local(&target)
+                            .inner
+                            .is_none()
+                    );
+                    assert!(
+                        local_token_accounts_by_owner(&client, owner, token_program)
+                            .await
+                            .is_empty()
+                    );
+                }
+                let requests = requests.lock().unwrap();
+                assert_eq!(requests.first().unwrap().1[0], mint.to_string());
+                if !found {
+                    assert_eq!(
+                        requests.len(),
+                        1,
+                        "a rejected mint must stop before target lookup"
+                    );
+                }
+            }
+        }
+
+        #[test_case::test_case(spl_token_interface::id(); "classic")]
+        #[test_case::test_case(spl_token_2022_interface::id(); "token_2022")]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn test_set_token_account_empty_mint(token_program: Pubkey) {
+            let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+            let owner = Pubkey::new_unique();
+            let mint = Pubkey::new_unique();
+            let mut account = token_mint_account(token_program);
+            account.data.clear();
+            set_token_fixture(&client, mint, account).await;
+            client
+                .rpc
+                .set_token_account(
+                    Some(client.context.clone()),
+                    owner.to_string(),
+                    mint.to_string(),
+                    TokenAccountUpdate {
+                        amount: Some(42),
+                        ..Default::default()
+                    },
+                    Some(token_program.to_string()),
+                )
+                .await
+                .unwrap();
+            let target =
+                get_associated_token_address_with_program_id(&owner, &mint, &token_program);
+            let account = client
+                .context
+                .svm_locker
+                .get_account_local(&target)
+                .inner
+                .map_account()
+                .unwrap();
+            assert_eq!(TokenAccount::unpack(&account.data).unwrap().amount(), 42);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn test_set_confidential_token_account_validation_precedence() {
+            for token_program in [spl_token_interface::id(), spl_token_2022_interface::id()] {
+                let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+                let owner = Pubkey::new_unique();
+                let mint = Pubkey::new_unique();
+                let error = client
+                    .rpc
+                    .set_token_account(
+                        Some(client.context.clone()),
+                        owner.to_string(),
+                        mint.to_string(),
+                        TokenAccountUpdate {
+                            confidential: Some(Default::default()),
+                            ..Default::default()
+                        },
+                        Some(token_program.to_string()),
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.code, jsonrpc_core::ErrorCode::InvalidParams);
+                if token_program == spl_token_interface::id() {
+                    assert!(
+                        error.message.contains(
+                            "confidential transfer accounts require the Token-2022 program"
+                        )
+                    );
+                } else {
+                    assert_eq!(
+                        error.message,
+                        format!(
+                            "Mint account {mint} not found; create it with surfnet_setAccount or make it available upstream"
+                        )
+                    );
+                }
+                let target =
+                    get_associated_token_address_with_program_id(&owner, &mint, &token_program);
+                assert!(
+                    client
+                        .context
+                        .svm_locker
+                        .get_account_local(&target)
+                        .inner
+                        .is_none()
+                );
+            }
+        }
+
+        #[test_case::test_case(spl_token_interface::id(), spl_token_interface::native_mint::id(); "classic")]
+        #[test_case::test_case(spl_token_2022_interface::id(), spl_token_2022_interface::native_mint::id(); "token_2022")]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn test_set_native_token_account(token_program: Pubkey, mint: Pubkey) {
+            let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+            let owner = Pubkey::new_unique();
+            if token_program == spl_token_2022_interface::id() {
+                // LiteSVM preloads the classic native mint only. This case checks
+                // explicit mint setup; Token-2022 native lamport backing remains unchanged.
+                assert!(
+                    client
+                        .context
+                        .svm_locker
+                        .get_account_local(&mint)
+                        .inner
+                        .is_none()
+                );
+                let mut account = token_mint_account(token_program);
+                let mut state = Mint::unpack(&account.data).unwrap();
+                state.decimals = 9;
+                state.pack_into_slice(&mut account.data);
+                set_token_fixture(&client, mint, account).await;
+            }
+            for amount in [42, 84] {
+                client
+                    .rpc
+                    .set_token_account(
+                        Some(client.context.clone()),
+                        owner.to_string(),
+                        mint.to_string(),
+                        TokenAccountUpdate {
+                            amount: Some(amount),
+                            ..Default::default()
+                        },
+                        Some(token_program.to_string()),
+                    )
+                    .await
+                    .unwrap();
+                let target =
+                    get_associated_token_address_with_program_id(&owner, &mint, &token_program);
+                let account = client
+                    .context
+                    .svm_locker
+                    .get_account_local(&target)
+                    .inner
+                    .map_account()
+                    .unwrap();
+                assert_eq!(
+                    TokenAccount::unpack(&account.data).unwrap().amount(),
+                    amount
+                );
+                if token_program == spl_token_interface::id() {
+                    let rent = client.context.svm_locker.with_svm_reader(|svm| {
+                        svm.inner
+                            .minimum_balance_for_rent_exemption(account.data.len())
+                    });
+                    assert_eq!(account.lamports, rent + amount);
+                }
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_set_token_2022_amount_preserves_extension_account_lamports() {
         use spl_token_2022_interface::{
@@ -5751,6 +6476,11 @@ mod tests {
         let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
         let owner = Keypair::new();
         let mint = Keypair::new();
+        set_account(
+            &client,
+            &mint.pubkey(),
+            &token_mint_account(spl_token_2022_interface::id()),
+        );
         let token_program = spl_token_2022_interface::id();
 
         // Owner's confidential keys (in practice derived from the wallet signer).
@@ -5832,6 +6562,11 @@ mod tests {
         let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
         let owner = Keypair::new();
         let mint = Keypair::new();
+        set_account(
+            &client,
+            &mint.pubkey(),
+            &token_mint_account(spl_token_2022_interface::id()),
+        );
 
         let elgamal = ElGamalKeypair::new_rand();
         let elgamal_b58 =
@@ -5860,10 +6595,9 @@ mod tests {
                 Some(spl_token_2022_interface::id().to_string()),
             )
             .await;
-        assert!(
-            result.is_err(),
-            "confidential account without aesKey should fail"
-        );
+        let error = result.expect_err("confidential account without aesKey should fail");
+        assert_eq!(error.code, jsonrpc_core::ErrorCode::InvalidParams);
+        assert!(error.message.contains("aesKey is required"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -5883,6 +6617,11 @@ mod tests {
         let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
         let owner = Keypair::new();
         let mint = Keypair::new();
+        set_account(
+            &client,
+            &mint.pubkey(),
+            &token_mint_account(spl_token_2022_interface::id()),
+        );
         let token_program = spl_token_2022_interface::id();
 
         let elgamal = ElGamalKeypair::new_rand();
@@ -5953,6 +6692,11 @@ mod tests {
         let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
         let owner = Keypair::new();
         let mint = Keypair::new();
+        set_account(
+            &client,
+            &mint.pubkey(),
+            &token_mint_account(spl_token_2022_interface::id()),
+        );
         let token_program = spl_token_2022_interface::id();
         let token_account = get_associated_token_address_with_program_id(
             &owner.pubkey(),
@@ -6125,6 +6869,11 @@ mod tests {
         let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
         let owner = Keypair::new();
         let mint = Keypair::new();
+        set_account(
+            &client,
+            &mint.pubkey(),
+            &token_mint_account(spl_token_2022_interface::id()),
+        );
         let token_program = spl_token_2022_interface::id();
         let token_account = get_associated_token_address_with_program_id(
             &owner.pubkey(),
